@@ -1,107 +1,90 @@
--- HSC Player in LÖVE
--- Ported from ChscPlayer (hsc.cpp) and validated against the HSC File Format
--- Spec by Simon Peter.  Fixes applied (C++ bugs → spec corrections):
+-- HSC Player in LÖVE — OPL register-level driver.
 --
--- From hsc.cpp comparison:
---   1. storeInstr: removed early-return guard (always re-apply, like C++)
---   2. storeInstr: slide is NOT initialised from instrument data; accumulated
---      by pitch-slide effects and reset only on a new note
---   3. Frequency formula: finetune (instr[inst][12]) and accumulated slide are
---      both added (C++: Fnr = note_table[note%12] + instr[inst][11] + slide)
---   4. Pitch-slide effects (0x10/0x20): removed spurious +1; fnum update only
---      when no note is present on the row (C++: if(!note) setfreq(...))
---   5. Volume effects (0xA0/0xB0/0xC0): AM/VIB flag bits (bits 6-7) preserved
---      from instrument TL byte (C++: vol | (instr[...][2] & ~63))
---   6. Added missing 0xD0 position-jump effect
---   7. Instrument-set: uses bit.band(note, 0x80) so all note bytes with bit 7
---      set trigger the command, not only exactly 0x80
---   8. Arrangement check moved to start of processed row; always consumes all
---      51 orderlist bytes to keep the file pointer correctly aligned
+-- This is a faithful port of ChscPlayer (AdPlug / hsc.cpp by Simon Peter),
+-- driving the real Nuked-OPL3 chip via audioSystem.write().  Instead of
+-- approximating FM in Lua, the player now writes the exact OPL2 registers the
+-- original DOS driver wrote, so waveform select, KSL, the modulator envelope,
+-- feedback and percussion mode all come for free from the emulated chip.
 --
--- From HSC spec (new fixes):
---   9.  NoteToFnum: corrected to spec's exact table
---         {363,385,408,432,458,485,514,544,577,611,647,686}
---       Old table started at 342 (not in spec) and was missing 686, shifting
---       every note lookup by one semitone.
---  10.  Finetune (byte 12): spec says "signed; add to frequency". The finetune
---       is the HIGH NIBBLE (bits 7-4), treated as a 4-bit signed value (-8..+7).
---       Range ≈ ±0.36 semitones — correct for a fine-tune field.
---       Previous wrong "fix" used the full byte as signed -128..127, turning
---       raw 0x77 into finetune=119 (+5.4 semitones!) on most instruments.
---  11.  Orderlist is exactly 51 bytes (spec offset 1536, size 51).  Old code
---       read only 50, misaligning the file pointer for all pattern data.
---  12.  Instrument number from note byte: spec says "low 6 bits" → mask 0x3F.
---       Old code used 0x7F (7 bits), potentially selecting instruments 64-127
---       when only instruments 0-63 are reachable via this command.
+-- The chip interface is injected as `HSCPlayer.opl` (a table with `write(reg,
+-- value)` and `resetChip()`); main.lua wires it to audioSystem.  Until then a
+-- no-op stub is used so loading never touches a chip that isn't ready.
+--
+-- Register mapping (HSC instrument byte → OPL register, per the HSC spec):
+--   byte1→0x23  byte2→0x20   (AM/VIB/EGT/KSR/MULT : carrier / modulator)
+--   byte3→0x43  byte4→0x40   (KSL/TL)
+--   byte5→0x63  byte6→0x60   (AR/DR)
+--   byte7→0x83  byte8→0x80   (SL/RR)
+--   byte9→0xC0  (feedback/connection)
+--   byte10→0xE3 byte11→0xE0  (waveform select)
+--   byte12 = signed finetune (added to the frequency number)
+-- Carrier registers are modulator-base + 3; the per-channel modulator operator
+-- offset is op_table[chan].
 
 local HSCPlayer = {}
 
--- Frequency-number lookup table (one entry per semitone, 12 total).
--- Taken verbatim from the HSC spec:
---   const unsigned short note_table[12] = {363,385,408,432,458,485,514,544,577,611,647,686};
--- The previous table was wrong: it started at 342 (not in the spec) and was
--- missing 686 (the B note), shifting every note lookup by one semitone.
+local band, bor, bxor   = bit.band, bit.bor, bit.bxor
+local lshift, rshift    = bit.lshift, bit.rshift
+local bnot              = bit.bnot
+local format, floor     = string.format, math.floor
+
+-- Standard AdLib operator-offset table: modulator operator register offset for
+-- each of the 9 melodic channels (carrier = this + 3).  1-indexed: [chan+1].
+local op_table = {0x00, 0x01, 0x02, 0x08, 0x09, 0x0A, 0x10, 0x11, 0x12}
+
+-- Frequency-number lookup table (one entry per semitone), verbatim from spec.
 local NoteToFnum = {363, 385, 408, 432, 458, 485, 514, 544, 577, 611, 647, 686}
 
--- Spec: "Any HSC module is played back at a fixed timer rate of 18.2Hz
--- (the standard rate, so no timer reprogram is needed)."
--- One tick = one OPL interrupt ≈ 54.945 ms.
--- LOVE calls love.update(dt) at ~60 fps which is ~3.3× too fast without this.
-local TICK_PERIOD = 1 / 18.2   -- seconds per OPL timer tick
+local noteNames = {"C-","C#","D-","D#","E-","F-","F#","G-","G#","A-","A#","B-"}
+
+-- Spec: fixed 18.2 Hz timer.  LÖVE calls love.update(dt) at ~60 fps, so we gate
+-- the player to one OPL tick (~54.9 ms) of real time.
+local TICK_PERIOD = 1 / 18.2
+
+-- No-op chip until main.lua injects the real audio backend (keeps load() safe).
+HSCPlayer.opl = { write = function() end, resetChip = function() end }
 
 -- ── Playback state ──────────────────────────────────────────────────────────
 HSCPlayer.state = {
-    songpos   = 0,     -- current position in the orders/song array
-    pattern   = 0,     -- current pattern number (derived from orders[songpos])
-    pattpos   = 0,     -- current row within the pattern (0-63)
+    songpos   = 0,
+    pattern   = 0,
+    pattpos   = 0,
     speed     = 2,
-    del       = 1,     -- countdown to next row (mirrors C++ `del`)
+    del       = 1,
     songend   = false,
-    pattbreak = 0,     -- pending pattern-break / position-jump counter
-    tickAccum = 0,     -- real-time accumulator for 18.2 Hz tick pacing
-    -- Percussion / fade-in state (mirrors C++ mode6, bd, fadein)
-    mode6     = false, -- 6-voice percussion mode; toggled by effects 05/06
-    bd        = 0,     -- shadow of OPL 0xBD register (percussion trigger bits)
-    fadein    = 0,     -- fade-in counter: set to 31 by effect 03, decrements each tick
+    pattbreak = 0,
+    tickAccum = 0,
+    mode6     = false,   -- 6-voice percussion mode
+    bd        = 0,       -- shadow of OPL 0xBD (percussion trigger bits)
+    fadein    = 0,       -- fade-in counter (effect 03)
+    mtkmode   = false,   -- MPU-401 Trakker note-off-by-one bug imitation
 }
 
 -- ── Per-channel state ───────────────────────────────────────────────────────
 HSCPlayer.channels = {}
 for i = 1, 9 do
     HSCPlayer.channels[i] = {
-        instr             = 0,
-        -- freq: the raw OPL frequency number (Fnr in C++), updated by note
-        --       play, pitch-slide effects, finetune, and accumulated slide.
-        freq              = 0,
-        -- octave: ((note/12) & 7) << 2, ready for the OPL 0xB0 register.
-        octave            = 0,
-        -- slide: accumulated pitch offset; reset to 0 on every new note.
-        slide             = 0,
-        -- Combined fnum for display (freq | octave<<8); not used for OPL writes.
-        fnum              = 0,
-        tlCarrier         = 0,
-        tlModulator       = 0,
-        updateFnum        = false,
-        updateTlCarrier   = false,
-        updateTlModulator = false,
+        instr = 0,
+        freq  = 0,       -- raw OPL frequency number (Fnr)
+        slide = 0,       -- accumulated pitch slide; reset on each new note
         state = {
             note           = 0,
             active         = false,
-            noteTriggered  = false,
             instrumentName = "",
-            volume         = 100,
             cell           = "... 00",
             fxDesc         = "NullFx",
-        }
+        },
     }
 end
 
+-- adl_freq[chan+1]: shadow of each channel's 0xB0 register (keyon | block | fnum-hi)
+HSCPlayer.adl_freq = {0, 0, 0, 0, 0, 0, 0, 0, 0}
+
 HSCPlayer.instr    = {}
 HSCPlayer.patterns = {}
--- orders[]: 0-indexed, exactly 50 entries matching C++ song[0..49]
-HSCPlayer.orders   = {}
+HSCPlayer.orders   = {}   -- 0-indexed, 50 usable entries
 
--- ── File loader ─────────────────────────────────────────────────────────────
+-- ── File loader (unchanged logic) ───────────────────────────────────────────
 function HSCPlayer:load(filename)
     local file = love.filesystem.newFile(filename)
     if not file:open("r") then
@@ -114,49 +97,28 @@ function HSCPlayer:load(filename)
         for j = 1, 12 do
             self.instr[i][j] = file:read(1):byte()
         end
-        -- Mirror bit 6 into bit 7 for the carrier and modulator TL bytes
-        -- (identical to the xor in the original C++ driver)
-        self.instr[i][3] = bit.bxor(self.instr[i][3],
-            bit.lshift(bit.band(self.instr[i][3], 0x40), 1))
-        self.instr[i][4] = bit.bxor(self.instr[i][4],
-            bit.lshift(bit.band(self.instr[i][4], 0x40), 1))
-        -- Byte 12: finetune.
-        -- Spec: "finetune (signed; add to frequency)".
-        -- The finetune is packed in the HIGH NIBBLE of byte 12 (bits 7-4).
-        -- Range is 0-15 as a 4-bit signed value:  0-7 = fine-tune up (+0..+7),
-        -- 8-15 = fine-tune down (-8..-1).  The smallest semitone step in the
-        -- note_table is 22 Fnum units, so the max shift of ±8 is ±0.36 semitones,
-        -- which is exactly what a fine-tune field should do.
-        --
-        -- Previous wrong "fix": treated the whole byte as a signed -128..127 value.
-        -- That turned raw byte 0x77 (instruments 2-6 in this song) into finetune=119,
-        -- shifting every note by 5+ semitones and making everything sound detuned.
-        --
-        -- Previous original code: bit.rshift(data[12], 4) → correct nibble, but
-        -- unsigned (0-15). Now we also apply the 4-bit signed conversion.
-        local nibble = bit.rshift(self.instr[i][12], 4)   -- extract high nibble
-        self.instr[i][12] = nibble < 8 and nibble or (nibble - 16)  -- 4-bit signed
+        -- Mirror bit 6 into bit 7 for carrier/modulator TL bytes (matches the
+        -- xor in the original C++ driver's loader).
+        self.instr[i][3] = bxor(self.instr[i][3], lshift(band(self.instr[i][3], 0x40), 1))
+        self.instr[i][4] = bxor(self.instr[i][4], lshift(band(self.instr[i][4], 0x40), 1))
+        -- Byte 12: finetune is the high nibble as a 4-bit signed value (-8..+7).
+        local nibble = rshift(self.instr[i][12], 4)
+        self.instr[i][12] = nibble < 8 and nibble or (nibble - 16)
     end
 
-    -- FIX 3: The spec defines the orderlist as exactly 51 bytes (offset 1536,
-    -- size 51).  We must consume all 51 bytes from the file so the read pointer
-    -- lands correctly at the start of the pattern data.  Only the first 50
-    -- entries (indices 0-49) are used for playback (C++ wraps with % 50);
-    -- the 51st byte is always 0xFF (end-of-list sentinel) and is discarded.
+    -- Orderlist is exactly 51 bytes; only the first 50 are used (51st = 0xFF).
     for i = 0, 50 do
         local b = file:read(1)
         if not b or #b == 0 then break end
-        if i <= 49 then          -- only store the 50 usable entries
+        if i <= 49 then
             self.orders[i] = b:byte()
         end
-        -- index 50 is the mandatory 0xFF sentinel; read and discard it
     end
 
-    -- Read all remaining bytes as packed pattern data
+    -- Remaining bytes = packed patterns (64 rows × 9 channels × 2 bytes).
     local patternData = file:read()
     local pos         = 1
     local patternIndex = 0
-    -- Each pattern: 64 rows × 9 channels × 2 bytes = 1152 bytes
     while pos + (64 * 9 * 2) - 1 <= #patternData do
         self.patterns[patternIndex] = {}
         for row = 0, 63 do
@@ -173,18 +135,18 @@ function HSCPlayer:load(filename)
 
     file:close()
 
-    -- Initialise channels 0-8 each to instrument i (mirrors C++ rewind())
+    -- Initialise channels 0-8 each to instrument i (mirrors C++ rewind()).
     for i = 0, 8 do
-        self:storeInstr(i, i)
+        self:setinstr(i, i)
     end
 end
 
--- ── Pretty-printers (debug helpers, logic unchanged) ────────────────────────
+-- ── Pretty-printers (debug helpers, unchanged) ──────────────────────────────
 local function getMIDINoteName(noteNumber)
     if noteNumber == nil or noteNumber == 0 then return "..." end
-    local noteNames = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"}
-    local octave    = math.floor(noteNumber / 12) + 1
-    return string.format("%s%d", noteNames[(noteNumber % 12) + 1], octave)
+    local names  = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"}
+    local octave = floor(noteNumber / 12) + 1
+    return string.format("%s%d", names[(noteNumber % 12) + 1], octave)
 end
 
 function HSCPlayer:prettyPrintPatternsToFile(filename)
@@ -207,37 +169,6 @@ function HSCPlayer:prettyPrintPatternsToFile(filename)
     file:close()
 end
 
-function HSCPlayer:prettyPrintInstrToFile(filename)
-    local function tableToString(tbl, indent)
-        indent = indent or 0
-        local keys = {}
-        for k in pairs(tbl) do keys[#keys + 1] = k end
-        table.sort(keys, function(a, b)
-            if type(a) == "number" and type(b) == "number" then return a < b
-            else return tostring(a) < tostring(b) end
-        end)
-        local result = "{\n"
-        for _, key in ipairs(keys) do
-            local value = tbl[key]
-            result = result .. string.rep("  ", indent + 1) .. tostring(key) .. " = "
-            if type(value) == "table" then
-                result = result .. tableToString(value, indent + 1)
-            elseif type(value) == "string" then
-                result = result .. string.format("%q", value)
-            else
-                result = result .. tostring(value)
-            end
-            result = result .. ",\n"
-        end
-        return result .. string.rep("  ", indent) .. "}"
-    end
-    local file = io.open(filename, "w")
-    if not file then error("Could not open file for writing: " .. filename) end
-    file:write("Instruments:\n")
-    file:write("HSCPlayer.instr = " .. tableToString(self.instr) .. "\n\n")
-    file:close()
-end
-
 function HSCPlayer:prettyPrintOrdersToFile(filename)
     local file = io.open(filename, "w")
     if not file then error("Could not open file for writing: " .. filename) end
@@ -250,32 +181,52 @@ function HSCPlayer:prettyPrintOrdersToFile(filename)
     file:close()
 end
 
--- ── storeInstr ───────────────────────────────────────────────────────────────
--- Apply instrument data to a channel.
---
--- FIX 1: The early-return guard (`if instr == same then return end`) has been
---         removed.  C++ always re-applies the instrument (OPL register writes
---         are unconditional), so Lua must too.
--- FIX 2: slide is NOT touched here.  In C++ slide accumulates through pitch-
---         slide effects and is reset only when a new note is played (see the
---         `if(note) channel[chan].slide = 0` guard in update()).
-function HSCPlayer:storeInstr(chan, instr)
-    self.channels[chan + 1].instr = instr
-    self.channels[chan + 1].state.instrumentName = string.format("Instrument %d", instr)
+-- ── OPL helpers (faithful ports of ChscPlayer::setinstr/setfreq/setvolume) ───
 
-    local data = self.instr[instr + 1]
-    if not data then return end
+-- Program a channel with an instrument: write all 11 OPL operator/channel regs.
+function HSCPlayer:setinstr(chan, insnr)
+    self.channels[chan + 1].instr = insnr
+    self.channels[chan + 1].state.instrumentName = format("Instrument %d", insnr)
 
-    -- Lua index 3 = C++ instr[...][2] = carrier TL byte
-    -- Lua index 4 = C++ instr[...][3] = modulator TL byte
-    self.channels[chan + 1].tlCarrier         = data[3]
-    self.channels[chan + 1].updateTlCarrier   = true
-    self.channels[chan + 1].tlModulator       = data[4]
-    self.channels[chan + 1].updateTlModulator = true
+    local ins = self.instr[insnr + 1]
+    if not ins then return end
+
+    local op  = op_table[chan + 1]
+    local opl = self.opl
+    opl.write(0x20 + op,   ins[2])    -- modulator AM/VIB/EGT/KSR/MULT
+    opl.write(0x23 + op,   ins[1])    -- carrier
+    opl.write(0x40 + op,   ins[4])    -- modulator KSL/TL
+    opl.write(0x43 + op,   ins[3])    -- carrier
+    opl.write(0x60 + op,   ins[6])    -- modulator AR/DR
+    opl.write(0x63 + op,   ins[5])    -- carrier
+    opl.write(0x80 + op,   ins[8])    -- modulator SL/RR
+    opl.write(0x83 + op,   ins[7])    -- carrier
+    opl.write(0xC0 + chan, ins[9])    -- feedback/connection
+    opl.write(0xE0 + op,   ins[11])   -- modulator waveform
+    opl.write(0xE3 + op,   ins[10])   -- carrier waveform
+end
+
+-- Set a channel's frequency number, preserving its keyon/block bits.
+function HSCPlayer:setfreq(chan, freq)
+    local af = bor(band(self.adl_freq[chan + 1], bnot(3)), band(rshift(freq, 8), 3))
+    self.adl_freq[chan + 1] = af
+    self.opl.write(0xA0 + chan, band(freq, 0xFF))
+    self.opl.write(0xB0 + chan, af)
+end
+
+-- Set carrier (and, in additive mode, modulator) volume via TL, preserving the
+-- instrument's KSL bits.  `volc`/`volm` are TL attenuation values (0 = loud).
+function HSCPlayer:setvolume(chan, volc, volm)
+    local ins = self.instr[self.channels[chan + 1].instr + 1]
+    if not ins then return end
+    local op = op_table[chan + 1]
+    self.opl.write(0x43 + op, bor(volc, band(ins[3], bnot(63))))
+    if band(ins[9], 1) ~= 0 then
+        self.opl.write(0x40 + op, bor(volm, band(ins[4], bnot(63))))
+    end
 end
 
 -- ── rewind ───────────────────────────────────────────────────────────────────
--- Reset playback to the beginning (mirrors ChscPlayer::rewind).
 function HSCPlayer:rewind()
     self.state.songpos   = 0
     self.state.pattern   = 0
@@ -285,58 +236,47 @@ function HSCPlayer:rewind()
     self.state.del       = 1
     self.state.songend   = false
     self.state.tickAccum = 0
+    self.state.mode6     = false
+    self.state.bd        = 0
+    self.state.fadein    = 0
+
+    self.opl.resetChip()   -- OPL2-style chip re-init
 
     for i = 0, 8 do
         local ch = self.channels[i + 1]
-        ch.freq              = 0
-        ch.octave            = 0
-        ch.slide             = 0
-        ch.fnum              = 0
-        ch.state.note        = 0
-        ch.state.active      = false
-        ch.state.noteTriggered = false
-        ch.state.volume      = 100
-        ch.state.cell        = "... 00"
-        ch.state.fxDesc      = "NullFx"
-        self:storeInstr(i, i)
+        ch.freq                = 0
+        ch.slide               = 0
+        ch.state.note          = 0
+        ch.state.active        = false
+        ch.state.cell          = "... 00"
+        ch.state.fxDesc        = "NullFx"
+        self.adl_freq[i + 1]   = 0
+        self:setinstr(i, i)
     end
-    self.state.mode6  = false
-    self.state.bd     = 0
-    self.state.fadein = 0
 end
 
 -- ── update ───────────────────────────────────────────────────────────────────
--- Call from love.update(dt) every frame.
---
--- SPEED FIX: Spec mandates "a fixed timer rate of 18.2 Hz (the standard rate)."
--- Each call advances the real-time accumulator by `dt` seconds; only when a
--- full 18.2 Hz tick (~54.9 ms) has elapsed does the player's `del` counter
--- decrement and (when del reaches 0) a pattern row get processed.
--- Without this, LÖVE's ~60 fps call rate would run the music ~3.3× too fast.
--- Omitting `dt` forces one raw tick through unconditionally (useful for tests).
---
--- Returns true while still playing, false once the song has ended.
+-- Call from love.update(dt).  Gated to the 18.2 Hz OPL tick rate; returns true
+-- while still playing.  Omitting `dt` forces one raw tick (useful for tests).
 function HSCPlayer:update(dt)
-
     -- ── 18.2 Hz real-time gate ───────────────────────────────────────────────
     if dt ~= nil then
         self.state.tickAccum = self.state.tickAccum + dt
         if self.state.tickAccum < TICK_PERIOD then
-            return not self.state.songend  -- not a full tick yet; do nothing
+            return not self.state.songend
         end
         self.state.tickAccum = self.state.tickAccum - TICK_PERIOD
-        -- any residual time carries forward naturally to the next call
     end
 
-    -- ── Fade-in counter: decrement once per tick (mirrors C++ `if(fadein) fadein--`) ──
-    if self.state.fadein > 0 then
-        self.state.fadein = self.state.fadein - 1
-    end
-
-    -- ── Speed / timing (mirrors C++ `del--; if(del) return !songend;`) ──────
+    -- ── Speed handling: del--; if still counting, no row this tick (C++ order) ──
     self.state.del = self.state.del - 1
     if self.state.del > 0 then
         return not self.state.songend
+    end
+
+    -- Fade-in decrements once per processed row (matches C++ placement).
+    if self.state.fadein > 0 then
+        self.state.fadein = self.state.fadein - 1
     end
 
     -- ── Arrangement / pattern selection ──────────────────────────────────────
@@ -345,272 +285,199 @@ function HSCPlayer:update(dt)
         self.state.songend = true
         return false
     end
-
     if pattnr >= 0xB2 then
-        -- Values >= 0xB2 (including 0xFF) signal end-of-song / corrupt data
         self.state.songend = true
         self.state.songpos = 0
         pattnr = self.orders[0] or 0
-    elseif bit.band(pattnr, 0x80) ~= 0 and pattnr <= 0xB1 then
-        -- Jump marker: low 7 bits encode the destination songpos
-        self.state.songpos = bit.band(pattnr, 0x7F)
+    elseif band(pattnr, 0x80) ~= 0 and pattnr <= 0xB1 then
+        self.state.songpos = band(pattnr, 0x7F)
         self.state.pattpos = 0
         pattnr = self.orders[self.state.songpos] or 0
         self.state.songend = true
     end
-
     self.state.pattern = pattnr
 
     -- ── Process all 9 channels for the current row ─────────────────────────
     local pattoff = self.state.pattpos * 9
+    local opl     = self.opl
 
     for chan = 0, 8 do
         local ch = self.channels[chan + 1]
-
-        -- Clear per-row visualisation state at the start of each processed row
-        ch.state.noteTriggered = false
-        ch.state.fxDesc        = "NullFx"
-        if ch.state.note == -1 then ch.state.note = 0 end
+        ch.state.fxDesc = "NullFx"
 
         local patternRow = self.patterns[pattnr]
-        if not patternRow then goto continue end
+        local cell       = patternRow and patternRow[pattoff + chan]
+        local note       = cell and cell.note or 0
+        local effect     = cell and cell.effect or 0
 
-        local cell = patternRow[pattoff + chan]
-        if not cell then goto continue end
-
-        local note   = cell.note
-        local effect = cell.effect or 0
-
-        -- ── FIX 4: Instrument-set uses low 6 bits per spec ───────────────
-        -- Spec: "If bit 7 is set, it's not a note, but an instrument to be
-        --        set (low 6 bits)."  Old code used 0x7F (7 bits) by mistake.
-        if bit.band(note, 0x80) ~= 0 then
-            local instrNum = bit.band(effect, 0x3F)
-            self:storeInstr(chan, instrNum)
-            ch.state.cell = string.format("III %02X", instrNum)
+        -- Instrument-set: bit 7 of note set → set instrument (C++ uses the
+        -- effect byte as the instrument number).
+        if band(note, 0x80) ~= 0 then
+            local insnr = band(effect, 0x3F)
+            self:setinstr(chan, insnr)
+            ch.state.cell   = format("III %02X", insnr)
+            ch.state.fxDesc = "SetInstr"
             goto continue
         end
 
-        local eff_op     = bit.band(effect, 0x0F)
-        local effectType = bit.band(effect, 0xF0)
-        local inst       = ch.instr
-
-        -- FIX 3 (partial): Reset accumulated slide whenever a note is present.
-        -- C++: `if(note) channel[chan].slide = 0;` (before the effect switch).
-        if note ~= 0 then
-            ch.slide = 0
-        end
+        local eff_op  = band(effect, 0x0F)
+        local effType = band(effect, 0xF0)
+        local inst    = ch.instr
+        if note ~= 0 then ch.slide = 0 end
 
         -- ── Effect handling ────────────────────────────────────────────────
-        if effectType == 0x00 then
-            -- Global effects
+        if effType == 0x00 then
             if eff_op == 1 then
                 ch.state.fxDesc      = "PatternBreak"
                 self.state.pattbreak = self.state.pattbreak + 1
             elseif eff_op == 3 then
-                -- Fade-in: volume ramps from near-silent to full over 31 ticks.
-                -- C++: fadein = 31 → each tick: setvolume(chan, fadein*2, fadein*2)
-                ch.state.fxDesc  = "FadeIn"
+                ch.state.fxDesc   = "FadeIn"
                 self.state.fadein = 31
             elseif eff_op == 5 then
-                -- 6-voice percussion mode ON (channels 6-8 become drums)
                 ch.state.fxDesc  = "PercMode ON"
                 self.state.mode6 = true
             elseif eff_op == 6 then
-                -- 6-voice percussion mode OFF
                 ch.state.fxDesc  = "PercMode OFF"
                 self.state.mode6 = false
             end
 
-        elseif effectType == 0x10 then
-            -- FIX 4: Pitch slide UP — no spurious +1; only update fnum when
-            -- there is no note on this row (C++: `if(!note) setfreq(…)`).
+        elseif effType == 0x10 then
             ch.state.fxDesc = "PitchSlideUp"
             ch.freq  = ch.freq  + eff_op
             ch.slide = ch.slide + eff_op
-            if note == 0 then ch.updateFnum = true end
+            if note == 0 then self:setfreq(chan, ch.freq) end
 
-        elseif effectType == 0x20 then
-            -- FIX 4: Pitch slide DOWN — same corrections as 0x10.
+        elseif effType == 0x20 then
             ch.state.fxDesc = "PitchSlideDown"
             ch.freq  = ch.freq  - eff_op
             ch.slide = ch.slide - eff_op
-            if note == 0 then ch.updateFnum = true end
+            if note == 0 then self:setfreq(chan, ch.freq) end
 
-        elseif effectType == 0x50 then
-            -- Set percussion instrument — unimplemented (as in C++)
-            do end
+        elseif effType == 0x50 then
+            -- Set percussion instrument — unimplemented (as in C++).
 
-        elseif effectType == 0x60 then
-            -- Set feedback — OPL register write only; no Lua-side state needed
-            do end
+        elseif effType == 0x60 then
+            ch.state.fxDesc = "SetFeedback"
+            local d = self.instr[inst + 1]
+            if d then opl.write(0xC0 + chan, bor(band(d[9], 1), lshift(eff_op, 1))) end
 
-        elseif effectType == 0xA0 then
-            -- FIX 5: Set carrier volume, preserving AM/VIB flags (bits 6-7).
-            -- C++: `vol | (instr[channel[chan].inst][2] & ~63)`
-            --       Lua index [3] = C++ index [2] (carrier TL byte).
+        elseif effType == 0xA0 then
             ch.state.fxDesc = "SetCarrierVol"
-            local instrData = self.instr[inst + 1]
-            if instrData then
-                ch.tlCarrier      = bit.bor(
-                    bit.lshift(eff_op, 2),
-                    bit.band(instrData[3], 0xC0))   -- preserve AM/VIB flags
-                ch.updateTlCarrier = true
+            local d = self.instr[inst + 1]
+            if d then
+                opl.write(0x43 + op_table[chan + 1],
+                    bor(lshift(eff_op, 2), band(d[3], bnot(63))))
             end
 
-        elseif effectType == 0xB0 then
-            -- VOLUME FIX: Set modulator volume.
-            -- In FM (non-additive) synthesis the modulator shapes the carrier's
-            -- timbre; its TL controls harmonic depth, NOT loudness.  Overwriting
-            -- it with a volume-scaled value distorts the sound and makes it thin
-            -- or nearly silent.  Only in ADDITIVE mode (instrument byte 9 bit 0
-            -- = 1) does the modulator contribute directly to the OPL output, so
-            -- only then is it valid to treat its TL as a volume register.
-            -- C++ writes the register unconditionally (a known quirk); we match
-            -- the INTENDED semantics of the effect: modulator volume in additive,
-            -- no-op in FM mode.
+        elseif effType == 0xB0 then
+            -- Set modulator volume.  C++ writes this unconditionally; on a real
+            -- chip that is the authentic behaviour (it changes the modulation
+            -- index / timbre in FM mode, loudness in additive mode).
             ch.state.fxDesc = "SetModulatorVol"
-            local instrData = self.instr[inst + 1]
-            if instrData and bit.band(instrData[9], 1) ~= 0 then
-                -- Additive mode only: modulator adds to output → valid volume.
-                ch.tlModulator       = bit.bor(
-                    bit.lshift(eff_op, 2),
-                    bit.band(instrData[4], 0xC0))   -- preserve KSL flags
-                ch.updateTlModulator = true
+            local d = self.instr[inst + 1]
+            if d then
+                opl.write(0x40 + op_table[chan + 1],
+                    bor(lshift(eff_op, 2), band(d[4], bnot(63))))
             end
-            -- FM mode: intentionally leave tlModulator unchanged.
 
-        elseif effectType == 0xC0 then
-            -- FIX 5: Set instrument volume (carrier, and optionally modulator).
-            -- C++: carrier always; modulator only when instr[inst][8] & 1 (additive).
-            --       Lua index [9] = C++ index [8] (connection/additive flag).
+        elseif effType == 0xC0 then
             ch.state.fxDesc = "SetVolume"
-            local instrData = self.instr[inst + 1]
-            if instrData then
-                local db = bit.lshift(eff_op, 2)
-                ch.tlCarrier      = bit.bor(db, bit.band(instrData[3], 0xC0))
-                ch.updateTlCarrier = true
-                if bit.band(instrData[9], 1) ~= 0 then   -- additive synthesis
-                    ch.tlModulator       = bit.bor(db, bit.band(instrData[4], 0xC0))
-                    ch.updateTlModulator = true
+            local d = self.instr[inst + 1]
+            if d then
+                local db = lshift(eff_op, 2)
+                local op = op_table[chan + 1]
+                opl.write(0x43 + op, bor(db, band(d[3], bnot(63))))
+                if band(d[9], 1) ~= 0 then
+                    opl.write(0x40 + op, bor(db, band(d[4], bnot(63))))
                 end
             end
 
-        elseif effectType == 0xD0 then
-            -- FIX 6: Position jump (was completely absent in original Lua).
-            -- C++: `pattbreak++; songpos = eff_op; songend = 1;`
-            -- The pattbreak handler then increments songpos by one more, so
-            -- the effective destination is eff_op + 1 (replicates C++ exactly).
+        elseif effType == 0xD0 then
             ch.state.fxDesc      = "PosJump"
             self.state.pattbreak = self.state.pattbreak + 1
             self.state.songpos   = eff_op
             self.state.songend   = true
 
-        elseif effectType == 0xF0 then
-            -- Set speed (del = ++speed in C++ means speed becomes eff_op+1)
+        elseif effType == 0xF0 then
             ch.state.fxDesc  = "SetSpeed"
             self.state.speed = eff_op + 1
             self.state.del   = self.state.speed
         end
 
-        -- ── Fade-in volume: scale channel toward full volume as fadein counts down ──
-        -- C++: if(fadein) setvolume(chan, fadein*2, fadein*2)
-        -- fadein*2 is used as a TL attenuation value (0=loud, 62=near-silent).
-        -- We expose this as a 0-100 volume so the audio layer can scale mixing.
+        -- Fade-in volume: writes TL each row while fading (C++ setvolume).
         if self.state.fadein > 0 then
-            ch.state.volume = 100 - math.floor(self.state.fadein * 2 * 100 / 62)
+            self:setvolume(chan, self.state.fadein * 2, self.state.fadein * 2)
         end
 
         -- ── Note handling ─────────────────────────────────────────────────
         if note == 0 then
-            ch.state.cell = string.format("... %02X", effect)
+            ch.state.cell = format("... %02X", effect)
             goto continue
         end
 
-        note = note - 1   -- convert to 0-based (mirrors C++ `note--`)
+        note = note - 1
+        if self.state.mtkmode then note = note - 1 end
 
-        -- Pause (raw 0x7F → 0x7E after decrement) or out-of-range octave.
-        -- C++ check: `(note == 0x7f-1) || ((note/12) & ~7)`
-        -- `(note/12) & ~7` is non-zero when octave > 7.
-        if note == 0x7E or math.floor(note / 12) > 7 then
-            ch.state.note  = -1       -- marks key-off / pause
-            ch.updateFnum  = true
-            ch.state.cell  = string.format("Pau %02X", effect)
+        -- Pause (raw 0x7F) or out-of-range octave → clear keyon.
+        if note == 0x7E or floor(note / 12) > 7 then
+            self.adl_freq[chan + 1] = band(self.adl_freq[chan + 1], bnot(32))
+            opl.write(0xB0 + chan, self.adl_freq[chan + 1])
+            ch.state.active = false
+            ch.state.cell   = format("Pau %02X", effect)
             goto continue
         end
 
-        -- ── FIX 3: Play note with finetune and accumulated slide ──────────
-        -- Spec:  frequency = note_table[note%12] + instrument_finetune + slide
-        -- C++:   Fnr = note_table[note%12] + instr[inst][11] + channel[chan].slide
-        -- Lua index [12] = C++ index [11] (signed finetune byte, converted at load).
         do
-            local instrData = self.instr[inst + 1]
-            local finetune  = instrData and instrData[12] or 0
+            local d        = self.instr[inst + 1]
+            local finetune = d and d[12] or 0
+            local Okt      = lshift(band(floor(note / 12), 7), 2)
+            local Fnr      = NoteToFnum[note % 12 + 1] + finetune + ch.slide
+            ch.freq = Fnr
 
-            ch.freq   = NoteToFnum[note % 12 + 1] + finetune + ch.slide
-            -- Octave in OPL 0xB0 format: bits 2-4 = (oct & 7)
-            ch.octave = bit.lshift(bit.band(math.floor(note / 12), 7), 2)
-            ch.updateFnum          = true
-            ch.state.note          = note
-            ch.state.active        = true
-            -- In percussion mode (mode6), channels 6-8 (0-indexed) are drums.
-            -- C++ does NOT set the key-on bit via 0xB0 for these; it triggers
-            -- them via the 0xBD register instead.  We suppress noteTriggered so
-            -- the audio layer doesn't retrigger the FM voice as a melodic note.
-            ch.state.noteTriggered = not (self.state.mode6 and chan >= 6)
+            -- In percussion mode the drum channels (6-8) are NOT keyed via 0xB0.
+            if (not self.state.mode6) or chan < 6 then
+                self.adl_freq[chan + 1] = bor(Okt, 32)
+            else
+                self.adl_freq[chan + 1] = Okt
+            end
 
-            local noteNames = {"C-","C#","D-","D#","E-","F-","F#","G-","G#","A-","A#","B-"}
-            ch.state.cell = string.format(
-                "%s%d %02X",
-                noteNames[note % 12 + 1],
-                math.floor(note / 12) + 1,
-                effect)
+            opl.write(0xB0 + chan, 0)   -- key off before retrigger (clean attack)
+            self:setfreq(chan, Fnr)
+
+            if self.state.mode6 then
+                local bd = self.state.bd
+                if chan == 6 then
+                    opl.write(0xBD, band(bd, bnot(16))); bd = bor(bd, 48)   -- bass drum
+                elseif chan == 7 then
+                    opl.write(0xBD, band(bd, bnot(1)));  bd = bor(bd, 33)   -- hi-hat
+                elseif chan == 8 then
+                    opl.write(0xBD, band(bd, bnot(2)));  bd = bor(bd, 34)   -- cymbal
+                end
+                self.state.bd = bd
+                opl.write(0xBD, bd)
+            end
+
+            ch.state.note   = note
+            ch.state.active = true
+            ch.state.cell   = format("%s%d %02X",
+                noteNames[note % 12 + 1], floor(note / 12) + 1, effect)
         end
 
         ::continue::
-    end -- for chan
+    end
 
-    -- ── Advance speed counter ────────────────────────────────────────────────
+    -- ── Advance speed / song / pattern position ─────────────────────────────
     self.state.del = self.state.speed
-
-    -- ── Advance song / pattern position ─────────────────────────────────────
-    -- Mirrors C++ post-row handling exactly, including the pattbreak path.
     if self.state.pattbreak > 0 then
         self.state.pattpos   = 0
         self.state.pattbreak = 0
         self.state.songpos   = (self.state.songpos + 1) % 50
-        if self.state.songpos == 0 then
-            self.state.songend = true
-        end
+        if self.state.songpos == 0 then self.state.songend = true end
     else
         self.state.pattpos = (self.state.pattpos + 1) % 64
         if self.state.pattpos == 0 then
             self.state.songpos = (self.state.songpos + 1) % 50
-            if self.state.songpos == 0 then
-                self.state.songend = true
-            end
-        end
-    end
-
-    -- ── Update derived visualisation state ──────────────────────────────────
-    for i = 0, 8 do
-        local ch = self.channels[i + 1]
-
-        if ch.updateFnum then
-            ch.updateFnum = false
-            -- Combine freq and octave into a single display value.
-            -- ch.octave = (oct & 7) << 2, so octave<<8 places it at bits 10-12.
-            ch.fnum = ch.freq + bit.lshift(ch.octave, 8)
-        end
-
-        if ch.updateTlCarrier then
-            ch.updateTlCarrier = false
-            -- TL attenuation: bits 0-5 (0 = loudest, 63 = silent)
-            ch.state.volume = 100 - bit.band(ch.tlCarrier, 0x3F) * 100 / 0x3F
-        end
-
-        if ch.updateTlModulator then
-            ch.updateTlModulator = false
+            if self.state.songpos == 0 then self.state.songend = true end
         end
     end
 

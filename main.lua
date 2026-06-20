@@ -19,13 +19,15 @@ function love.load()
     font = love.graphics.newFont(14)
     love.graphics.setFont(font)
 
+    -- Bring up the OPL chip first, then hand it to the player as its register
+    -- sink before loading (load() programs the initial instruments).
+    audioSystem.init()
+
     player = HSCPlayer
+    player.opl = audioSystem
     player:load("MUSIC/NEOINTRO.HSC")
     --player:prettyPrintPatternsToFile("pattern.txt")
-    --player:prettyPrintInstrToFile("instr.txt")
     --player:prettyPrintOrdersToFile("orders.txt")
-
-    audioSystem.init()
 end
 
 function love.update(dt)
@@ -35,25 +37,11 @@ function love.update(dt)
     if play then
         -- HSCPlayer:update(dt) gates itself to exactly 18.2 Hz internally.
         -- One call per frame is all that is needed; no local accumulator required.
+        -- The player now writes OPL registers directly inside update(); there is
+        -- no per-note bridge to drive. The chip produces audio continuously.
         local stillPlaying = player:update(dt)
         if not stillPlaying then
             play = false   -- stop automatically when the song ends
-        end
-
-        for i = 1, 9 do
-            local channel = player.channels[i]
-            if channel.state.noteTriggered then
-                local note = channel.state.note
-                local instrumentData = player.instr[channel.instr + 1]
-                -- note is 0-indexed HSC semitone (0=C oct0 … 95=B oct7).
-                -- MIDI note 60 = C4. OPL block-4 C ≈ 275 Hz ≈ MIDI C4.
-                -- Offset +12 maps HSC octave 4 (note 48) → MIDI 60 (C4). ✓
-                audioSystem.playNote(i, note + 12, instrumentData)
-                channel.state.noteTriggered = false
-            elseif channel.state.note == -1 then -- Key off
-                audioSystem.stopNote(i)
-                channel.state.note = 0
-            end
         end
     end
 
@@ -124,7 +112,7 @@ function love.draw()
                 end
                 love.graphics.print(noteStr, x + 5, y + 2)
 
-                if audioSystem.channels[channel].active then
+                if player.channels[channel].state.active then
                     love.graphics.setColor(0, 1, 0, 0.3)
                     love.graphics.rectangle("fill", x, y, cellWidth, cellHeight)
                     love.graphics.setColor(1, 1, 1)
@@ -149,8 +137,10 @@ function love.keypressed(key)
     if key == "r" then
         play = false
         love.audio.stop()
-        player:rewind()
+        -- Recreate the chip/source first, then rewind (which resets the chip and
+        -- reprograms the initial instruments onto the fresh chip).
         audioSystem.init()
+        player:rewind()
         currentRow = player.state.pattpos
         currentPattern = player.state.pattern
     end

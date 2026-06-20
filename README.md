@@ -1,14 +1,63 @@
 # love2d-hsc-player
-A HSC Player fully made in Love2D (Lua)
+A HSC (HSC-Tracker / NEO Software) AdLib music player in LÖVE.
 
----
+Playback is driven by the real **Nuked-OPL3** chip emulator (a cycle-accurate
+YMF262) via LuaJIT FFI. The Lua side is a faithful port of AdPlug's `ChscPlayer`
+that writes OPL2 registers exactly like the original DOS driver, so waveform
+select, KSL, the modulator envelope, feedback and percussion mode all come
+directly from the emulated chip instead of being approximated.
 
-### Cannot Fix (require deeper redesign)
+If the native DLL can't be loaded, the player automatically falls back to a
+pure-Lua software FM approximation (`softopl.lua`) — same register interface,
+lower fidelity, but no compiler required.
 
-1. **No real OPL2 emulator** — `audioSystem.lua` is a software FM approximation. Accurate timbre requires emulating the YM3812 (waveform shaping, tremolo/vibrato LFOs, envelope non-linearity, etc.).
-2. **Waveform select** (bytes 10/11 → OPL `0xE3`/`0xE0`): half-sine, abs-sine, quarter-sine variants are ignored; only sine is used.
-3. **KSL (Key Scale Level)** — bytes 3/4 bits 7:6 should attenuate high notes more steeply; not emulated.
-4. **Modulator ADSR** — bytes 6/8 (modulator AR/DR/SL/RR) are ignored; only the carrier envelope drives amplitude.
-5. **Percussion mode audio** (mode6) — channels 6–8 need separate drum synthesis (bass drum, hi-hat, cymbal) via the `0xBD` register; the software synth has no equivalent.
-6. **TL byte XOR at load** (lines 113–117 of `hscplayer.lua`) — the `setinstr()` body isn't in the provided `hsc.cpp`, so whether this bit-swap of KSL values is correct is unverifiable.
-7. **Fade-in volume not wired to audio** — `ch.state.volume` is updated in the player but `main.lua` doesn't pass it to `audioSystem.channels[i].volume`. Requires a one-liner addition once you decide on the scaling approach.
+## Building the native chip
+
+The emulator is compiled to `opl3.dll` (loaded by `opl3.lua` through FFI). The
+DLL's architecture **must match love.exe** — LÖVE 11.5 is x64, so build with a
+64-bit MinGW gcc (e.g. MSYS2 `ucrt64`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File native/build.ps1
+```
+
+This compiles `Nuked-OPL3/opl3.c` + `native/hsc_opl_shim.c` into
+`opl3.dll` in the repo root. (The Nuked-OPL3 source under `Nuked-OPL3/` is
+git-ignored; fetch it from https://github.com/nukeykt/Nuked-OPL3 if missing.)
+
+## Running
+
+```
+love .
+```
+
+Space = play/pause, `r` = rewind, Esc = quit.
+
+## Architecture
+
+| File | Role |
+|------|------|
+| `hscplayer.lua` | Pattern/order/effect logic; writes OPL registers (`setinstr`/`setfreq`/`setvolume`) at the 18.2 Hz HSC tick rate. |
+| `opl3.lua` | LuaJIT FFI binding to `opl3.dll` (alloc/reset/writeReg/generate). |
+| `softopl.lua` | Pure-Lua software FM approximation with the same interface — fallback when the DLL is unavailable. |
+| `audioSystem.lua` | Picks the backend, does the OPL2 power-on init, renders stereo audio straight into a LÖVE queueable source. |
+| `native/` | C shim + build script for the Nuked-OPL3 DLL. |
+
+### Note on register writes
+
+OPL register writes use Nuked's **buffered** path (`OPL3_WriteRegBuffered`), not
+immediate writes. HSC retriggers every note with a back-to-back key-off/key-on;
+Nuked is hardware-accurate and treats the key bit as a level, so without a
+generated sample between the two writes the envelope never re-attacks and most
+notes come out ~30 dB too quiet. Buffered writes reproduce the real OPL bus
+write-delay and fix this.
+
+## Still TODO / known gaps
+
+1. **OPL3 stereo / extended waveforms** are unused — the driver stays in OPL2
+   compatibility mode on purpose (HSC is an OPL2 format).
+2. **Set-percussion-instrument effect (`5x`)** is unimplemented, exactly as in
+   the original `ChscPlayer`.
+3. **Distribution** currently assumes a folder game with `opl3.dll` next to the
+   `.lua` files; a fused `.love` would need the DLL placed beside `love.exe` (or
+   loaded via a packaged path).
